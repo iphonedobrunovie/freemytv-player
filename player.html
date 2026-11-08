@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<!--
+  The idle playlist's player on Samsung (Tizen), packed with the app: player.html?list=<playlist>&ids=<id,id,...>.
+  The same player LG's service serves from 127.0.0.1 (webos/service/service.js, playerPage): the IFrame API plays the
+  ids one after another, in a loop; each one buffers muted behind its thumbnail, its sound fades in as it starts and
+  out before it ends, and the next one's thumbnail fades in about a second before the end, so there's no black screen.
+-->
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+#p, #p iframe { position: fixed; left: 0; top: 0; width: 100%; height: 100%; border: 0; }
+#cover { position: fixed; left: 0; top: 0; width: 100%; height: 100%; background: #000 center/cover no-repeat; opacity: 1;
+         -webkit-transition: opacity .8s; transition: opacity .8s; }
+#cover.off { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="p"></div><div id="cover"></div>
+<script>
+(function () {
+  function param(name) {
+    var m = new RegExp('[?&]' + name + '=([^&]*)').exec(location.search);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+  var list = param('list');
+  if (!/^(PL|UU|OL|FL)[A-Za-z0-9_-]{10,62}$/.test(list)) list = '';
+  var ids = param('ids').split(',').filter(function (x) { return /^[A-Za-z0-9_-]{11}$/.test(x); }).slice(0, 50);
+
+  if (!ids.length) {
+    // Without the ids: YouTube's own playlist embed, in a loop.
+    if (list) {
+      document.getElementById('cover').className = 'off';
+      document.getElementById('p').innerHTML = '<iframe allow="autoplay; encrypted-media" src="https://www.youtube.com/embed/videoseries?list='
+        + list + '&autoplay=1&loop=1&controls=0&rel=0&modestbranding=1&iv_load_policy=3&playsinline=1"></iframe>';
+    }
+    return;
+  }
+
+  var i = 0, p = null, phase = 'load', phaseAt = Date.now(), playingAt = 0, cover = document.getElementById('cover');
+  var AHEAD = 60, MAXWAIT = 90000, lastBuf = 0, grewAt = 0, vol = 100, rampT = null, fading = false;
+
+  // The sound fades in over 1.5 s as a video starts, and out over 2 s before it ends, under the thumbnail's fade.
+  function ramp(to, ms) {
+    clearInterval(rampT);
+    var from = vol, t0 = Date.now();
+    rampT = setInterval(function () {
+      var k = Math.min(1, (Date.now() - t0) / ms);
+      vol = from + (to - from) * k;
+      try { p.setVolume(Math.round(vol)); } catch (e) {}
+      if (k >= 1) clearInterval(rampT);
+    }, 80);
+  }
+  function current() { try { return p.getVideoData().video_id === ids[i]; } catch (e) { return false; } }
+  function best() { try { p.setPlaybackQuality('highres'); } catch (e) {} }
+  function thumb(id) {
+    var hi = 'https://i.ytimg.com/vi/' + id + '/maxresdefault.jpg', img = new Image();
+    cover.style.backgroundImage = 'url(https://i.ytimg.com/vi/' + id + '/hqdefault.jpg)';
+    img.onload = function () { if (img.naturalWidth > 120 && ids[i] === id) cover.style.backgroundImage = 'url(' + hi + ')'; };
+    img.src = hi;
+  }
+  function go(n) {
+    i = n % ids.length; phase = 'load'; fading = false; phaseAt = Date.now(); thumb(ids[i]); cover.className = '';
+    setTimeout(function () {
+      phaseAt = Date.now(); p.mute(); p.loadVideoById({videoId: ids[i], suggestedQuality: 'highres'}); best();
+    }, 850);
+  }
+  function next() { if (p) go(i + 1); }
+  function buffered() { var d = p.getDuration(); return d > 0 ? p.getVideoLoadedFraction() * d : 0; }
+  function start() {
+    phase = 'play'; playingAt = Date.now(); clearInterval(rampT); vol = 0;
+    p.setVolume(0); p.unMute(); best(); p.playVideo(); ramp(100, 1500);
+  }
+  function tick() {
+    if (!p || !p.getPlayerState) return;
+    var s = p.getPlayerState(), d = p.getDuration();
+    if (phase === 'load') {
+      if (!current()) return;
+      if (s === 1 && p.getDuration() > 0) { p.pauseVideo(); phase = 'buffer'; phaseAt = grewAt = Date.now(); lastBuf = 0; }
+      else if (Date.now() - phaseAt > 20000) next();
+      return;
+    }
+    // A minute ahead (all of it when shorter, 90 s of waiting at most); YouTube stops buffering a paused video after
+    // some seconds, so once it hasn't grown for 5 s, it plays.
+    if (phase === 'buffer') {
+      var want = Math.min(AHEAD, Math.max(0, d - 1.5)), b = buffered();
+      if (b > lastBuf + 0.5) { lastBuf = b; grewAt = Date.now(); }
+      if ((d > 0 && b >= want) || p.getVideoLoadedFraction() >= 0.999 || (b > 5 && Date.now() - grewAt > 5000)
+          || Date.now() - phaseAt > MAXWAIT) start();
+      return;
+    }
+    if (s === 1 && cover.className !== 'off') cover.className = 'off';
+    if (Date.now() - playingAt < 2500 || !current()) return;
+    var left = d - p.getCurrentTime();
+    if (!fading && d > 5 && p.getCurrentTime() > 1 && left < 3.2) { fading = true; ramp(0, 2000); }
+    if (s === 0 || (d > 2 && p.getCurrentTime() > 1 && left < 1.1)) next();
+  }
+
+  window.onYouTubeIframeAPIReady = function () {
+    p = new YT.Player('p', {
+      playerVars: {autoplay: 0, controls: 0, rel: 0, modestbranding: 1, iv_load_policy: 3, disablekb: 1, fs: 0,
+                   playsinline: 1, cc_load_policy: 0, vq: 'hd1080'},
+      events: {onReady: function () { go(0); }, onError: function () { next(); }}
+    });
+    setInterval(tick, 400);
+  };
+  thumb(ids[0]);
+  var api = document.createElement('script');
+  api.src = 'https://www.youtube.com/iframe_api';
+  document.body.appendChild(api);
+})();
+</script>
+</body>
+</html>
